@@ -3,7 +3,7 @@
 pytest==7.4.2
 httpx==0.25.0
 fakeredis==2.20.0
-evidently==0.4.5
+evidently==0.4.22
 selenium==4.14.0
 webdriver-manager==4.0.1
 psycopg2-binary==2.9.7
