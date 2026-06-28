@@ -262,7 +262,7 @@ class TestBranchOnDrift:
         ti = MagicMock()
         ti.xcom_pull.return_value = False
         task_branch_on_drift(ti=ti)
-        ti.xcom_pull.assert_called_with(task_ids="check_drift", key="needs_retraining")
+        ti.xcom_pull.assert_any_call(task_ids="check_drift", key="needs_retraining")
 
 
 class TestTaskCheckDrift:
@@ -285,13 +285,23 @@ class TestTaskCheckDrift:
         fake_drift.load_current_data     = MagicMock(return_value=MagicMock())
         fake_drift.run_data_drift_report = MagicMock(return_value=mock_result)
 
+        fake_decision = {
+            "should_retrain": True, "reason": "drift exceeded threshold",
+            "drift_score": 0.45, "drift_detected": True,
+            "cooldown_active": False, "cooldown_status": {},
+            "threshold_used": 0.3, "base_threshold": 0.3,
+            "adaptive": False, "recent_mean": None, "history_size": 0,
+            "current_score": 0.45,
+        }
+
         mock_ti = MagicMock()
         with patch.dict(sys.modules, {
             "src.monitoring.drift": fake_drift,
             "evidently": ModuleType("evidently"),
             "evidently.report": ModuleType("evidently.report"),
             "evidently.metric_preset": ModuleType("evidently.metric_preset"),
-        }):
+        }), patch("src.retraining.scheduler.evaluate_retraining_need",
+                  return_value=fake_decision):
             task_check_drift(ti=mock_ti)
 
         calls = {c[1]["key"]: c[1]["value"] for c in mock_ti.xcom_push.call_args_list}
