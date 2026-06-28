@@ -1,6 +1,7 @@
 global:
   resolve_timeout: 5m
-  slack_api_url: "${SLACK_WEBHOOK_URL}"
+  # Replace with your real Slack webhook URL (Settings > Slack Webhook)
+  slack_api_url: "http://localhost:9093/placeholder"
 
 route:
   receiver: default

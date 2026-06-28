@@ -30,9 +30,7 @@ x-db-env: &db-env
 
 x-airflow-env: &airflow-env
   AIRFLOW__CORE__EXECUTOR: LocalExecutor
-  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
-    postgresql+psycopg2://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}
-    @postgres:5432/${POSTGRES_DB:-mlops}
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/airflow"
   AIRFLOW__CORE__LOAD_EXAMPLES: "false"
   AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me-in-production}
   AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
@@ -51,14 +49,15 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     networks:
       - backend
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops} && psql -U ${POSTGRES_USER:-mlops} -d ${POSTGRES_DB:-mlops} -tc \"SELECT 1 FROM pg_database WHERE datname='airflow'\" | grep -q 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 10
+      start_period: 15s
 
   # ── MLflow Tracking Server ────────────────────────────────────────────────
   mlflow:
@@ -68,19 +67,17 @@ services:
     ports:
       - "5000:5000"
     environment:
-      MLFLOW_BACKEND_STORE_URI: >-
-        postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}
-        @postgres:5432/${POSTGRES_DB:-mlops}
+      MLFLOW_BACKEND_STORE_URI: "postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/mlflow"
       MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
     volumes:
       - mlflow_artifacts:/mlflow/artifacts
     networks:
       - backend
       - frontend
-    command: >
+    command: >-
       bash -c "pip install --quiet psycopg2-binary &&
       mlflow server
-      --backend-store-uri postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/${POSTGRES_DB:-mlops}
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/mlflow
       --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
       --port 5000"
@@ -157,18 +154,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: >
-      bash -c "
+    command:
+      - bash
+      - -c
+      - |
         airflow db upgrade &&
-        airflow users create
-          --username ${AIRFLOW_ADMIN_USER:-admin}
-          --password ${AIRFLOW_ADMIN_PASSWORD:-admin}
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email ${AIRFLOW_ADMIN_EMAIL:-admin@mlops.local}
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email "${AIRFLOW_ADMIN_EMAIL:-admin@mlops.local}" \
         || true
-      "
     restart: "no"
 
   # ── Airflow: webserver ────────────────────────────────────────────────────
@@ -180,7 +178,7 @@ services:
     container_name: mlops_airflow_webserver
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "8081:8080"
     environment:
       <<: [*airflow-env, *mlflow-env]
     volumes:
@@ -288,7 +286,7 @@ services:
     ports:
       - "9093:9093"
     environment:
-      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-http://localhost:9093/placeholder}
     volumes:
       - ../monitoring/alertmanager/config.yml:/etc/alertmanager/config.yml:ro
     networks:
