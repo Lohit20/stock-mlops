@@ -9,10 +9,11 @@ build/
 venv/
 .venv/
 
-# Data (tracked by DVC, not Git)
+# Data files tracked by DVC, not Git — .gitkeep preserves the dirs
 data/raw/*.csv
 data/processed/*.csv
 data/features/*.csv
+!data/**/.gitkeep
 
 # Models (tracked by DVC + MLflow)
 models/*/

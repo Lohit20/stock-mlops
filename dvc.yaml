@@ -1,0 +1,65 @@
+stages:
+
+  scrape:
+    desc: "Scrape daily prices (yfinance) + quarterly financials (Selenium)"
+    cmd: python -m src.ingestion.scraper
+    deps:
+      - src/ingestion/scraper.py
+    outs:
+      - data/raw:
+          cache: true
+          persist: true     # don't delete between runs — we accumulate daily files
+
+  validate:
+    desc: "Validate all raw data — stops pipeline if checks fail"
+    cmd: python -m src.ingestion.validator
+    deps:
+      - src/ingestion/validator.py
+      - data/raw
+    # No outs — validation is a gate, not a transform
+
+  featurize:
+    desc: "Clean raw data and engineer ML features"
+    cmd: python -m src.features.engineer
+    deps:
+      - src/features/engineer.py
+      - data/processed
+    outs:
+      - data/features:
+          cache: true
+
+  train_lstm:
+    desc: "Train LSTM model and log to MLflow"
+    cmd: python -m src.training.train_lstm
+    deps:
+      - src/training/train_lstm.py
+      - data/features
+    # Model artifacts tracked in MLflow, not DVC
+
+  train_tft:
+    desc: "Train TFT model and log to MLflow"
+    cmd: python -m src.training.train_tft
+    deps:
+      - src/training/train_tft.py
+      - data/features
+
+  train_timesfm:
+    desc: "Fine-tune TimesFM and log to MLflow"
+    cmd: python -m src.training.train_timesfm
+    deps:
+      - src/training/train_timesfm.py
+      - data/features
+
+  train_arm:
+    desc: "Train ARIMA model and log to MLflow"
+    cmd: python -m src.training.train_arm
+    deps:
+      - src/training/train_arm.py
+      - data/features
+
+  compare:
+    desc: "Compare all 4 models and promote best to MLflow Production"
+    cmd: python -m src.evaluation.compare_models
+    deps:
+      - src/evaluation/compare_models.py
+      - data/features

@@ -1,0 +1,126 @@
+name: CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, master]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── Test ────────────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: mlops
+          POSTGRES_PASSWORD: mlops
+          POSTGRES_DB: mlops
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create test env file
+        run: |
+          cat > .env << EOF
+          MLFLOW_TRACKING_URI=http://localhost:5000
+          MLFLOW_EXPERIMENT_NAME=stock_price_forecasting
+          RAW_DATA_PATH=data/raw
+          PROCESSED_DATA_PATH=data/processed
+          FEATURES_DATA_PATH=data/features
+          EOF
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --cov=src --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Lint ────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: pip install ruff
+      - run: ruff check src/ tests/
+
+  # ── Build & Push Docker Images ───────────────────────────────────────────────
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push serving image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.serving
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/serving:latest
+
+      - name: Build and push training image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.training
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/training:latest
+
+  # ── Notify ──────────────────────────────────────────────────────────────────
+  notify:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [test, lint, build]
+    if: always()
+    steps:
+      - name: Report status
+        run: |
+          echo "Test:  ${{ needs.test.result }}"
+          echo "Lint:  ${{ needs.lint.result }}"
+          echo "Build: ${{ needs.build.result }}"
