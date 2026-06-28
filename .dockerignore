@@ -1,0 +1,59 @@
+# Version control
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info
+.eggs
+dist
+build
+
+# Virtual environments
+venv
+.venv
+env
+
+# Local config and secrets
+.env
+.env.*
+!.env.example
+
+# Data files (mounted as volumes at runtime)
+data/raw/*.csv
+data/processed/*.csv
+data/features/*.csv
+mlruns/
+mlflow.db
+
+# Models (served via MLflow registry, not baked into image)
+models/
+
+# Test and dev artefacts
+.pytest_cache
+.coverage
+htmlcov
+tests/
+
+# Notebooks
+notebooks/
+*.ipynb
+.ipynb_checkpoints
+
+# IDE
+.vscode
+.idea
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Monitoring data (runtime-generated)
+monitoring/reports/
+
+# DVC cache (large, not needed in image)
+.dvc/cache
+.dvc/tmp

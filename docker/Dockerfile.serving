@@ -1,17 +1,54 @@
-# Dockerfile for FastAPI prediction server
+# ── Stage 1: dependency builder ───────────────────────────────────────────────
+# Compile wheels in a full image so the runtime stage stays slim.
+FROM python:3.11-slim AS builder
 
-FROM python:3.10-slim
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/base.txt    requirements/base.txt
+COPY requirements/serving.txt requirements/serving.txt
+
+RUN pip install --upgrade pip && \
+    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements/serving.txt
+
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+LABEL org.opencontainers.image.title="Stock Forecast API"
+LABEL org.opencontainers.image.description="FastAPI serving layer for stock price forecasting models"
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y gcc && rm -rf /var/lib/apt/lists/*
+# Install pre-built wheels (no compiler needed)
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Non-root user for security
+RUN useradd --create-home --shell /bin/bash appuser
+USER appuser
 
-COPY src/ ./src/
-COPY .env .
+# Application source (src/ only — data and models are mounted as volumes)
+COPY --chown=appuser:appuser src/ ./src/
+
+# Healthcheck — calls the /health endpoint every 30 s
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" \
+    || exit 1
 
 EXPOSE 8000
 
-CMD ["uvicorn", "src.serving.api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Tini handles signal forwarding so Ctrl-C works inside Docker
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8000
+
+CMD ["uvicorn", "src.serving.api:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "2", \
+     "--log-level", "info"]

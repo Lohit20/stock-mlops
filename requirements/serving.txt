@@ -1,0 +1,7 @@
+-r base.txt
+fastapi==0.103.1
+uvicorn[standard]==0.23.2
+pydantic==2.3.0
+redis==5.0.1
+prometheus-client==0.17.1
+statsmodels==0.14.0

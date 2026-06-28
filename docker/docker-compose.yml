@@ -1,145 +1,310 @@
-version: '3.8'
+version: "3.9"
 
-# What is Docker Compose?
-# It lets you run MULTIPLE containers with one command.
-# Instead of starting MLflow, Postgres, Grafana separately,
-# you just run: docker-compose up
-# and everything starts together.
+# ── Networks ───────────────────────────────────────────────────────────────────
+# backend  — internal service communication (DB, MLflow, Redis, Airflow)
+# frontend — externally reachable services (API, MLflow UI, Grafana, Airflow UI)
+networks:
+  backend:
+    driver: bridge
+    internal: true
+  frontend:
+    driver: bridge
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  mlflow_artifacts:
+  prometheus_data:
+  grafana_data:
+  airflow_logs:
+
+# ── Shared environment fragments ───────────────────────────────────────────────
+x-mlflow-env: &mlflow-env
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-stock_price_forecasting}
+
+x-db-env: &db-env
+  POSTGRES_USER:     ${POSTGRES_USER:-mlops}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlops}
+  POSTGRES_DB:       ${POSTGRES_DB:-mlops}
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+    postgresql+psycopg2://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}
+    @postgres:5432/${POSTGRES_DB:-mlops}
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me-in-production}
+  AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+  PYTHONPATH: /opt/airflow
 
 services:
 
-  # ── PostgreSQL Database ─────────────────────────────────────────────────────
-  # Used by: MLflow (stores experiment data) + Airflow (stores task history)
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
   postgres:
-    image: postgres:14
+    image: postgres:15-alpine
     container_name: mlops_postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: mlops
-      POSTGRES_PASSWORD: mlops
-      POSTGRES_DB: mlops
+      <<: *db-env
     ports:
-      - "5432:5432"       # Your machine:5432 → container:5432
+      - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data   # Data persists after restart
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mlops"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
-  # ── MLflow Tracking Server ──────────────────────────────────────────────────
-  # Open http://localhost:5000 in browser to see experiment dashboard
+  # ── MLflow Tracking Server ────────────────────────────────────────────────
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.7.1
     container_name: mlops_mlflow
+    restart: unless-stopped
     ports:
       - "5000:5000"
     environment:
-      MLFLOW_BACKEND_STORE_URI: postgresql://mlops:mlops@postgres:5432/mlops
+      MLFLOW_BACKEND_STORE_URI: >-
+        postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}
+        @postgres:5432/${POSTGRES_DB:-mlops}
       MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
     volumes:
       - mlflow_artifacts:/mlflow/artifacts
+    networks:
+      - backend
+      - frontend
     command: >
       mlflow server
-      --backend-store-uri postgresql://mlops:mlops@postgres:5432/mlops
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/${POSTGRES_DB:-mlops}
       --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
       --port 5000
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
-  # ── Redis Cache ─────────────────────────────────────────────────────────────
-  # Used by: FastAPI (caches recent predictions so repeat requests are instant)
+  # ── Redis ─────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: mlops_redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # ── FastAPI Prediction Server ───────────────────────────────────────────────
-  # Open http://localhost:8000/docs to see interactive API documentation
+  # ── FastAPI Prediction Server ─────────────────────────────────────────────
   api:
     build:
       context: ..
       dockerfile: docker/Dockerfile.serving
+    image: stock-forecast-api:latest
     container_name: mlops_api
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      REDIS_HOST: redis
+      <<: *mlflow-env
+      REDIS_URL: redis://redis:6379/0
+      FEATURES_DATA_PATH: /app/data/features
+      N_STEPS_IN:  "90"
+      N_STEPS_OUT: "30"
     volumes:
-      - ../data:/app/data
-      - ../models:/app/models
+      - ../data:/app/data:ro
+    networks:
+      - backend
+      - frontend
     depends_on:
-      - mlflow
-      - redis
+      mlflow:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
-  # ── Apache Airflow ──────────────────────────────────────────────────────────
-  # Open http://localhost:8080 to see pipeline dashboard
-  # Default login: admin / admin
-  airflow:
-    image: apache/airflow:2.7.1
-    container_name: mlops_airflow
+  # ── Airflow: one-shot DB init (runs once and exits) ───────────────────────
+  airflow-init:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
+    image: stock-forecast-airflow:latest
+    container_name: mlops_airflow_init
+    environment:
+      <<: *airflow-env
+      <<: *mlflow-env
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      bash -c "
+        airflow db upgrade &&
+        airflow users create
+          --username ${AIRFLOW_ADMIN_USER:-admin}
+          --password ${AIRFLOW_ADMIN_PASSWORD:-admin}
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email ${AIRFLOW_ADMIN_EMAIL:-admin@mlops.local}
+        || true
+      "
+    restart: "no"
+
+  # ── Airflow: webserver ────────────────────────────────────────────────────
+  airflow-webserver:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
+    image: stock-forecast-airflow:latest
+    container_name: mlops_airflow_webserver
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops@postgres:5432/mlops
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__WEBSERVER__SECRET_KEY: "your-secret-key-change-this"
+      <<: *airflow-env
+      <<: *mlflow-env
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../src:/opt/airflow/src
       - ../data:/opt/airflow/data
-    command: >
-      bash -c "airflow db init &&
-               airflow users create --username admin --password admin
-               --firstname Admin --lastname User --role Admin
-               --email admin@example.com &&
-               airflow webserver"
+      - airflow_logs:/opt/airflow/logs
+    networks:
+      - backend
+      - frontend
     depends_on:
-      postgres:
-        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: airflow webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
-  # ── Prometheus ──────────────────────────────────────────────────────────────
-  # Collects metrics from FastAPI every 15 seconds
-  # Open http://localhost:9090 to query raw metrics
+  # ── Airflow: scheduler ────────────────────────────────────────────────────
+  airflow-scheduler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
+    image: stock-forecast-airflow:latest
+    container_name: mlops_airflow_scheduler
+    restart: unless-stopped
+    environment:
+      <<: *airflow-env
+      <<: *mlflow-env
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../src:/opt/airflow/src
+      - ../data:/opt/airflow/data
+      - airflow_logs:/opt/airflow/logs
+    networks:
+      - backend
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: airflow scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --limit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Training (one-shot — run manually or via Airflow) ────────────────────
+  # docker compose run --rm trainer   (defaults to lstm)
+  # docker compose run -e MODEL_TYPE=arm --rm trainer
+  trainer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.training
+    image: stock-forecast-trainer:latest
+    container_name: mlops_trainer
+    environment:
+      <<: *mlflow-env
+      MODEL_TYPE: ${MODEL_TYPE:-lstm}
+      FEATURES_DATA_PATH: /app/data/features
+      RAW_DATA_PATH: /app/data/raw
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+    networks:
+      - backend
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    profiles:
+      - training
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:v2.45.0
+    image: prom/prometheus:v2.47.0
     container_name: mlops_prometheus
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
-      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
+    networks:
+      - backend
+      - frontend
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
 
-  # ── Grafana ─────────────────────────────────────────────────────────────────
-  # Beautiful dashboards for your metrics
-  # Open http://localhost:3000 (login: admin / admin)
+  # ── Grafana ───────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.1.0
     container_name: mlops_grafana
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s:%(http_port)s/"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning
-      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - backend
+      - frontend
     depends_on:
       - prometheus
-
-# ── Persistent Volumes ─────────────────────────────────────────────────────────
-# Data stored here survives container restarts
-volumes:
-  postgres_data:
-  mlflow_artifacts:
-  prometheus_data:
-  grafana_data:
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

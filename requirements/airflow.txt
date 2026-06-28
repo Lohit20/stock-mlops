@@ -1,0 +1,9 @@
+-r base.txt
+apache-airflow==2.7.1
+dvc==3.23.0
+yfinance==0.2.31
+requests==2.31.0
+ta==0.10.2
+statsmodels==0.14.0
+selenium==4.14.0
+webdriver-manager==4.0.1

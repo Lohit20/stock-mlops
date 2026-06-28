@@ -1,27 +1,48 @@
-# Dockerfile for model training
-#
-# What is a Dockerfile?
-# A recipe that tells Docker how to build your container.
-# It starts with a base image (Python 3.10) and adds your code + dependencies.
+# ── Stage 1: dependency builder ───────────────────────────────────────────────
+FROM python:3.11-slim AS builder
 
-FROM python:3.10-slim
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        git \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/base.txt     requirements/base.txt
+COPY requirements/training.txt requirements/training.txt
+
+RUN pip install --upgrade pip && \
+    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements/training.txt
+
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+LABEL org.opencontainers.image.title="Stock Forecast Trainer"
+LABEL org.opencontainers.image.description="Model training container for LSTM, TFT, TimesFM and ARM"
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    git \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies first (cached if requirements.txt unchanged)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
-# Copy source code
-COPY src/ ./src/
-COPY data/ ./data/
-COPY .env .
+# Non-root user
+RUN useradd --create-home --shell /bin/bash trainer
+USER trainer
 
-# Default command: train all models
-CMD ["python", "-m", "src.training.train_lstm"]
+COPY --chown=trainer:trainer src/  ./src/
+COPY --chown=trainer:trainer docker/entrypoint.training.sh /entrypoint.sh
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MODEL_TYPE=lstm
+
+# data/ and models/ are mounted as volumes by docker-compose
+
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]
