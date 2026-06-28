@@ -1,5 +1,5 @@
 """
-FastAPI Prediction Server — Step 10.
+FastAPI Prediction Server — Step 10 / Step 13.
 
 Endpoints
 ---------
@@ -14,6 +14,8 @@ GET  /registry/{model_type}/production production model info for one model type
 POST /admin/reload                     hot-reload all models from the registry
 DELETE /cache                          flush prediction cache (optional symbol/model filter)
 GET  /cache/stats                      cache hit/miss counters
+POST /monitoring/push                  ingest a pipeline-run summary → update Prometheus gauges
+GET  /monitoring/drift                 run live drift check and return result (also updates gauges)
 GET  /metrics                          Prometheus scrape endpoint
 """
 
@@ -52,6 +54,13 @@ PREDICTION_ERROR = Counter(
 )
 CACHE_HIT = Counter("api_cache_hits_total",   "Cache hits",   ["model"])
 CACHE_MISS = Counter("api_cache_misses_total", "Cache misses", ["model"])
+
+# Pipeline-level metrics (imported so they register in the same Prometheus registry)
+from src.monitoring.metrics import (  # noqa: E402
+    push_drift_metrics,
+    push_model_metrics,
+    push_pipeline_run_metrics,
+)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -463,6 +472,63 @@ def flush_cache(
 def get_cache_stats():
     from src.serving.cache import cache_stats
     return cache_stats()
+
+
+# ── /monitoring/* ────────────────────────────────────────────────────────────
+
+class MonitoringPushRequest(BaseModel):
+    """
+    Payload sent by the Airflow send_report task after each pipeline run.
+    All fields are optional — only present keys update Prometheus gauges.
+    """
+    drift_score:        float | None = None
+    drift_detected:     bool  | None = None
+    needs_retraining:   bool  | None = None
+    winner_model:       str   | None = None
+    winner_version:     str   | None = None
+    winner_rmse:        float | None = None
+    duration_seconds:   float | None = None
+    dataset:            str         = "price_features"
+    model_metrics:      dict        = {}  # model_type → {test_rmse, test_mape, ...}
+
+
+@app.post("/monitoring/push")
+def monitoring_push(payload: MonitoringPushRequest):
+    """
+    Accept a pipeline-run summary from Airflow and update all Prometheus gauges.
+    The Prometheus scrape endpoint (/metrics) will reflect updated values immediately.
+    """
+    summary = payload.model_dump()
+    push_pipeline_run_metrics(summary)
+
+    for model_type, eval_metrics in (payload.model_metrics or {}).items():
+        push_model_metrics(model_type, eval_metrics)
+
+    logger.info(
+        f"Monitoring push: drift={payload.drift_score} "
+        f"winner={payload.winner_model} retrain={payload.needs_retraining}"
+    )
+    return {"status": "ok", "updated": list(summary.keys())}
+
+
+@app.get("/monitoring/drift")
+def monitoring_drift():
+    """
+    Run a live data drift check, update Prometheus gauges, and return the result.
+    Wraps src.monitoring.drift.run_data_drift_report.
+    """
+    try:
+        from src.monitoring.drift import (
+            load_reference_data, load_current_data, run_data_drift_report,
+        )
+        reference = load_reference_data()
+        current   = load_current_data()
+        result    = run_data_drift_report(reference, current)
+        push_drift_metrics(result)
+        return result
+    except Exception as exc:
+        logger.error(f"Drift check failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ── /metrics (Prometheus) ─────────────────────────────────────────────────────

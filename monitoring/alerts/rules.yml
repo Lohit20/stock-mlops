@@ -1,0 +1,167 @@
+groups:
+
+  # ── API health ────────────────────────────────────────────────────────────
+  - name: api_health
+    interval: 30s
+    rules:
+
+      - alert: APIHighErrorRate
+        expr: |
+          100 * sum(rate(api_prediction_errors_total[5m]))
+               / (sum(rate(api_requests_total[5m])) + 0.001)
+          > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API prediction error rate above 5 %"
+          description: >
+            {{ $value | printf "%.1f" }}% of prediction requests are failing.
+            Check model loading and feature data availability.
+
+      - alert: APIHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            rate(api_request_duration_seconds_bucket[5m])
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p95 latency above 2 s"
+          description: >
+            95th-percentile request latency is {{ $value | printf "%.2f" }}s.
+            Consider scaling the serving container or reducing model complexity.
+
+      - alert: APICriticalLatencyP99
+        expr: |
+          histogram_quantile(
+            0.99,
+            rate(api_request_duration_seconds_bucket[5m])
+          ) > 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API p99 latency above 5 s"
+          description: >
+            99th-percentile latency is {{ $value | printf "%.2f" }}s — users are
+            experiencing very slow predictions.
+
+      - alert: APINoRequests
+        expr: |
+          sum(rate(api_requests_total[1h])) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No API prediction requests in the last hour"
+          description: >
+            The prediction API has received zero requests in 60 minutes.
+            Verify the service is reachable and clients are functioning.
+
+  # ── Cache health ──────────────────────────────────────────────────────────
+  - name: cache_health
+    interval: 60s
+    rules:
+
+      - alert: LowCacheHitRate
+        expr: |
+          sum(rate(api_cache_hits_total[10m]))
+          / (sum(rate(api_cache_hits_total[10m]))
+             + sum(rate(api_cache_misses_total[10m])) + 0.001)
+          < 0.3
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Prediction cache hit rate below 30 %"
+          description: >
+            Cache hit rate is {{ $value | printf "%.0f" }}%.
+            Consider increasing TTL or check if Redis is reachable.
+
+  # ── Data drift ────────────────────────────────────────────────────────────
+  - name: drift_monitoring
+    interval: 5m
+    rules:
+
+      - alert: HighDataDrift
+        expr: pipeline_drift_score{dataset="price_features"} > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data drift score above 0.5"
+          description: >
+            Drift score is {{ $value | printf "%.3f" }}.
+            This exceeds 0.5 — market regime may have shifted.
+            Retraining is scheduled if score > 0.3.
+
+      - alert: CriticalDataDrift
+        expr: pipeline_drift_score{dataset="price_features"} > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical data drift — score above 0.8"
+          description: >
+            Drift score is {{ $value | printf "%.3f" }}.
+            Current data looks very different from training data.
+            Manual inspection recommended.
+
+      - alert: RetrainingRequired
+        expr: pipeline_needs_retraining{dataset="price_features"} == 1
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "Drift threshold exceeded — retraining triggered"
+          description: >
+            The pipeline drift score exceeded the retraining threshold.
+            An automatic retraining run has been queued.
+
+  # ── Model performance ─────────────────────────────────────────────────────
+  - name: model_performance
+    interval: 5m
+    rules:
+
+      - alert: HighModelRMSE
+        expr: pipeline_model_rmse > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model {{ $labels.model_type }} RMSE above 20"
+          description: >
+            RMSE for {{ $labels.model_type }} is {{ $value | printf "%.2f" }}.
+            This indicates significant prediction error — consider retraining
+            or rolling back to the previous Production version.
+
+      - alert: LowDirectionalAccuracy
+        expr: pipeline_model_directional_accuracy < 0.45
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model {{ $labels.model_type }} directional accuracy below 45 %"
+          description: >
+            Directional accuracy is {{ $value | printf "%.1f" }}%.
+            Predictions are barely better than random — retraining recommended.
+
+  # ── Pipeline lifecycle ────────────────────────────────────────────────────
+  - name: pipeline_lifecycle
+    interval: 5m
+    rules:
+
+      - alert: PipelineNotRunning
+        expr: |
+          time() - pipeline_duration_seconds > 172800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline has not completed a run in more than 48 hours"
+          description: >
+            The last pipeline run finished more than 48 hours ago.
+            Check the Airflow scheduler and DAG status.

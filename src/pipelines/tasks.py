@@ -175,8 +175,23 @@ def task_branch_on_drift(**context) -> str:
 # ── Reporting ─────────────────────────────────────────────────────────────────
 
 def task_send_report(**context) -> None:
+    import requests as _req
     from src.notifications.report import send_pipeline_report
-    send_pipeline_report(context)
+
+    summary = send_pipeline_report(context)
+
+    # Push the summary to the API so Prometheus gauges are updated immediately.
+    api_url = os.getenv("API_URL", "http://localhost:8000")
+    try:
+        resp = _req.post(
+            f"{api_url}/monitoring/push",
+            json={k: v for k, v in summary.items() if v is not None},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        logger.info("Monitoring metrics pushed to API")
+    except Exception as exc:
+        logger.warning(f"Could not push monitoring metrics: {exc}")
 
 
 # ── Failure callback ──────────────────────────────────────────────────────────

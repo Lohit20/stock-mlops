@@ -266,6 +266,7 @@ services:
       - "9090:9090"
     volumes:
       - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alerts:/etc/prometheus/alerts:ro
       - prometheus_data:/prometheus
     networks:
       - backend
@@ -280,6 +281,52 @@ services:
       interval: 20s
       timeout: 5s
       retries: 3
+
+  # ── Alertmanager ──────────────────────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: mlops_alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    volumes:
+      - ../monitoring/alertmanager/config.yml:/etc/alertmanager/config.yml:ro
+    networks:
+      - backend
+      - frontend
+    command:
+      - --config.file=/etc/alertmanager/config.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://localhost:9093
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9093/-/healthy"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ── Node Exporter (system metrics: CPU, RAM, disk) ────────────────────────
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    container_name: mlops_node_exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.rootfs=/rootfs
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    networks:
+      - backend
+    pid: host
 
   # ── Grafana ───────────────────────────────────────────────────────────────
   grafana:
