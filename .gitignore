@@ -8,6 +8,10 @@ build/
 .env
 venv/
 .venv/
+.pytest_cache/
+
+# Claude Code
+.claude/
 
 # Data files tracked by DVC, not Git — .gitkeep preserves the dirs
 data/raw/*.csv
