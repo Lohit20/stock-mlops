@@ -1,0 +1,50 @@
+# Data
+pandas==2.0.3
+numpy==1.24.3
+selenium==4.14.0
+requests==2.31.0
+
+# Feature Engineering
+scikit-learn==1.3.0
+ta==0.10.2
+
+# ML Models
+tensorflow==2.13.0
+keras==2.13.0
+pytorch-lightning==2.0.6
+torch==2.0.1
+pytorch-forecasting==1.0.0
+statsmodels==0.14.0
+timesfm==1.0.0
+
+# MLflow
+mlflow==2.7.1
+
+# DVC
+dvc==3.23.0
+
+# Airflow
+apache-airflow==2.7.1
+
+# Serving
+fastapi==0.103.1
+uvicorn==0.23.2
+pydantic==2.3.0
+
+# Monitoring
+evidently==0.4.5
+prometheus-client==0.17.1
+
+# Database
+sqlalchemy==2.0.20
+psycopg2-binary==2.9.7
+
+# Testing
+pytest==7.4.2
+httpx==0.25.0
+
+# Utilities
+python-dotenv==1.0.0
+loguru==0.7.2
+hydra-core==1.3.2
+optuna==3.3.0

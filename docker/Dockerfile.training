@@ -1,0 +1,27 @@
+# Dockerfile for model training
+#
+# What is a Dockerfile?
+# A recipe that tells Docker how to build your container.
+# It starts with a base image (Python 3.10) and adds your code + dependencies.
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies first (cached if requirements.txt unchanged)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY src/ ./src/
+COPY data/ ./data/
+COPY .env .
+
+# Default command: train all models
+CMD ["python", "-m", "src.training.train_lstm"]

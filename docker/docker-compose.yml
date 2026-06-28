@@ -1,0 +1,145 @@
+version: '3.8'
+
+# What is Docker Compose?
+# It lets you run MULTIPLE containers with one command.
+# Instead of starting MLflow, Postgres, Grafana separately,
+# you just run: docker-compose up
+# and everything starts together.
+
+services:
+
+  # ── PostgreSQL Database ─────────────────────────────────────────────────────
+  # Used by: MLflow (stores experiment data) + Airflow (stores task history)
+  postgres:
+    image: postgres:14
+    container_name: mlops_postgres
+    environment:
+      POSTGRES_USER: mlops
+      POSTGRES_PASSWORD: mlops
+      POSTGRES_DB: mlops
+    ports:
+      - "5432:5432"       # Your machine:5432 → container:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # Data persists after restart
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MLflow Tracking Server ──────────────────────────────────────────────────
+  # Open http://localhost:5000 in browser to see experiment dashboard
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.7.1
+    container_name: mlops_mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://mlops:mlops@postgres:5432/mlops
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mlops:mlops@postgres:5432/mlops
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Redis Cache ─────────────────────────────────────────────────────────────
+  # Used by: FastAPI (caches recent predictions so repeat requests are instant)
+  redis:
+    image: redis:7-alpine
+    container_name: mlops_redis
+    ports:
+      - "6379:6379"
+
+  # ── FastAPI Prediction Server ───────────────────────────────────────────────
+  # Open http://localhost:8000/docs to see interactive API documentation
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.serving
+    container_name: mlops_api
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      REDIS_HOST: redis
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+    depends_on:
+      - mlflow
+      - redis
+
+  # ── Apache Airflow ──────────────────────────────────────────────────────────
+  # Open http://localhost:8080 to see pipeline dashboard
+  # Default login: admin / admin
+  airflow:
+    image: apache/airflow:2.7.1
+    container_name: mlops_airflow
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops@postgres:5432/mlops
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "your-secret-key-change-this"
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../src:/opt/airflow/src
+      - ../data:/opt/airflow/data
+    command: >
+      bash -c "airflow db init &&
+               airflow users create --username admin --password admin
+               --firstname Admin --lastname User --role Admin
+               --email admin@example.com &&
+               airflow webserver"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  # Collects metrics from FastAPI every 15 seconds
+  # Open http://localhost:9090 to query raw metrics
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: mlops_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  # Beautiful dashboards for your metrics
+  # Open http://localhost:3000 (login: admin / admin)
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: mlops_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+
+# ── Persistent Volumes ─────────────────────────────────────────────────────────
+# Data stored here survives container restarts
+volumes:
+  postgres_data:
+  mlflow_artifacts:
+  prometheus_data:
+  grafana_data:
