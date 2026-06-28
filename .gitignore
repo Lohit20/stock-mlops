@@ -19,6 +19,9 @@ data/processed/*.csv
 data/features/*.csv
 !data/**/.gitkeep
 
+# Runtime state (cooldown + drift history) — not committed
+data/state/
+
 # Models (tracked by DVC + MLflow)
 models/*/
 *.h5

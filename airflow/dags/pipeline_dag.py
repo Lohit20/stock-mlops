@@ -55,6 +55,7 @@ from src.pipelines.tasks import (
     task_deploy_to_api,
     task_check_drift,
     task_branch_on_drift,
+    task_record_retrain,
     task_send_report,
     on_failure,
 )
@@ -191,6 +192,15 @@ t11_retrain = TriggerDagRunOperator(
     task_id="trigger_retrain",
     trigger_dag_id="stock_forecast_pipeline",
     wait_for_completion=False,
+    conf={"triggered_by": "drift_detection"},
+    dag=dag,
+)
+
+t11_record = PythonOperator(
+    task_id="record_retrain",
+    python_callable=task_record_retrain,
+    provide_context=True,
+    execution_timeout=timedelta(minutes=2),
     dag=dag,
 )
 
@@ -220,4 +230,6 @@ t6_compare >> t7_register >> t8_deploy >> t9_drift >> t10_branch
 
 t10_branch >> [t11_retrain, t11_skip]
 
-[t11_retrain, t11_skip] >> t12_report
+t11_retrain >> t11_record
+
+[t11_record, t11_skip] >> t12_report

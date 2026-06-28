@@ -137,25 +137,43 @@ def task_deploy_to_api(**context) -> None:
         ti.xcom_push(key="reloaded_models", value=[])
 
 
-# ── Monitoring ────────────────────────────────────────────────────────────────
+# ── Monitoring + retraining decision ─────────────────────────────────────────
 
 def task_check_drift(**context) -> None:
+    """
+    Run Evidently drift check then pass it through the retraining scheduler
+    (adaptive threshold + cooldown guard) to produce a final should_retrain
+    decision.  All results are pushed to XCom for downstream tasks.
+    """
     from src.monitoring.drift import (
         load_reference_data, load_current_data, run_data_drift_report,
     )
-    ti        = context["ti"]
+    from src.retraining.scheduler import evaluate_retraining_need
+
+    ti       = context["ti"]
+    dag_run  = context.get("dag_run")
+    run_id   = dag_run.run_id if dag_run else None
+
     reference = load_reference_data()
     current   = load_current_data()
-    result    = run_data_drift_report(reference, current)
+    drift_res = run_data_drift_report(reference, current)
+
+    decision = evaluate_retraining_need(drift_res, dag_run_id=run_id)
 
     logger.info(
-        f"Drift score: {result['drift_score']:.3f} | "
-        f"Detected: {result['drift_detected']} | "
-        f"Needs retrain: {result['needs_retraining']}"
+        f"Drift score: {decision['drift_score']:.3f} | "
+        f"Threshold: {decision['threshold_used']:.3f} | "
+        f"Cooldown active: {decision['cooldown_active']} | "
+        f"Should retrain: {decision['should_retrain']}"
     )
-    ti.xcom_push(key="needs_retraining", value=result["needs_retraining"])
-    ti.xcom_push(key="drift_score",      value=result["drift_score"])
-    ti.xcom_push(key="drift_detected",   value=result["drift_detected"])
+
+    ti.xcom_push(key="needs_retraining", value=decision["should_retrain"])
+    ti.xcom_push(key="drift_score",      value=decision["drift_score"])
+    ti.xcom_push(key="drift_detected",   value=decision["drift_detected"])
+    ti.xcom_push(key="retrain_reason",   value=decision["reason"])
+    ti.xcom_push(key="cooldown_active",  value=decision["cooldown_active"])
+    ti.xcom_push(key="threshold_used",   value=decision["threshold_used"])
+    ti.xcom_push(key="cooldown_status",  value=decision["cooldown_status"])
 
 
 def task_branch_on_drift(**context) -> str:
@@ -165,11 +183,33 @@ def task_branch_on_drift(**context) -> str:
     """
     ti            = context["ti"]
     needs_retrain = ti.xcom_pull(task_ids="check_drift", key="needs_retraining")
+    reason        = ti.xcom_pull(task_ids="check_drift", key="retrain_reason") or ""
+
     if needs_retrain:
-        logger.info("Drift detected — routing to trigger_retrain")
+        logger.info(f"Routing to trigger_retrain: {reason}")
         return "trigger_retrain"
-    logger.info("No significant drift — routing to skip_retrain")
+    logger.info(f"Routing to skip_retrain: {reason}")
     return "skip_retrain"
+
+
+def task_record_retrain(**context) -> None:
+    """
+    Called immediately after trigger_retrain fires.
+    Writes the cooldown timestamp and updates the drift history.
+    Non-fatal — pipeline continues even if state write fails.
+    """
+    from src.retraining.scheduler import record_retrain_triggered
+
+    ti      = context["ti"]
+    dag_run = context.get("dag_run")
+    run_id  = dag_run.run_id if dag_run else None
+    score   = ti.xcom_pull(task_ids="check_drift", key="drift_score")
+
+    try:
+        record_retrain_triggered(drift_score=score, dag_run_id=run_id)
+        logger.info(f"Retrain state recorded: score={score} run_id={run_id}")
+    except Exception as exc:
+        logger.warning(f"Could not record retrain state: {exc}")
 
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
