@@ -150,8 +150,7 @@ services:
     image: stock-forecast-airflow:latest
     container_name: mlops_airflow_init
     environment:
-      <<: *airflow-env
-      <<: *mlflow-env
+      <<: [*airflow-env, *mlflow-env]
     networks:
       - backend
     depends_on:
@@ -182,8 +181,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      <<: *airflow-env
-      <<: *mlflow-env
+      <<: [*airflow-env, *mlflow-env]
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../src:/opt/airflow/src
@@ -212,8 +210,7 @@ services:
     container_name: mlops_airflow_scheduler
     restart: unless-stopped
     environment:
-      <<: *airflow-env
-      <<: *mlflow-env
+      <<: [*airflow-env, *mlflow-env]
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../src:/opt/airflow/src
