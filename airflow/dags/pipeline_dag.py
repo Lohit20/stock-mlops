@@ -1,164 +1,100 @@
 """
-Apache Airflow DAG — Full MLOps Pipeline.
+Apache Airflow DAG — Full MLOps Pipeline (Step 12).
 
+Pipeline topology
+─────────────────
+scrape_live_data
+  └─► validate_data
+        └─► version_data
+              └─► clean_and_engineer_features
+                    └─► train_lstm ┐
+                        train_tft  ├─ (parallel)
+                    train_timesfm  │
+                        train_arm  ┘
+                              └─► compare_models
+                                    └─► register_best_model
+                                          └─► deploy_to_api
+                                                └─► check_drift
+                                                      └─► branch_on_drift
+                                                            ├─► trigger_retrain ─┐
+                                                            └─►  skip_retrain   ─┤
+                                                                                  └─► send_report
 
-What is a DAG?
-DAG = Directed Acyclic Graph = a sequence of tasks with dependencies.
+Schedule: 6 PM Monday–Friday (after NYSE close).
 
-Think of it as a recipe:
-Step 1 must finish before Step 2 starts,
-Steps 5a/5b/5c can run at the same time,
-Step 6 waits for ALL of Step 5 to finish.
-
-This DAG runs every day at 6PM (after market close):
-1.  scrape_live_data
-2.  validate_data
-3.  version_data
-4.  clean_and_engineer
-5a. train_lstm        ┐
-5b. train_tft         ├── all run in parallel
-5c. train_timesfm     │
-5d. train_arm         ┘
-6.  compare_models
-7.  register_best_model
-8.  deploy_to_api
-9.  check_drift
-10. send_report
+Key design decisions
+────────────────────
+- Training tasks run in parallel; compare_models waits for ALL_SUCCESS.
+- deploy_to_api calls POST /admin/reload — non-fatal if API is down.
+- branch_on_drift uses BranchPythonOperator; send_report joins via
+  NONE_FAILED_MIN_ONE_SUCCESS so it always runs regardless of branch.
+- trigger_retrain re-queues this same DAG (wait_for_completion=False).
+- All tasks share on_failure_callback → Slack alert.
+- Training tasks have execution_timeout guards (TFT gets 4 h, others less).
 """
 
 from datetime import datetime, timedelta
-from loguru import logger
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.operators.bash import BashOperator
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.trigger_rule import TriggerRule
 
-# Default settings applied to every task in the DAG
+from src.pipelines.tasks import (
+    task_scrape,
+    task_validate,
+    task_version_data,
+    task_feature_engineering,
+    task_train_lstm,
+    task_train_tft,
+    task_train_timesfm,
+    task_train_arm,
+    task_compare_models,
+    task_register_model,
+    task_deploy_to_api,
+    task_check_drift,
+    task_branch_on_drift,
+    task_send_report,
+    on_failure,
+)
+
+# ── DAG ───────────────────────────────────────────────────────────────────────
+
 default_args = {
-    "owner":            "mlops",
-    "depends_on_past":  False,       # Don't wait for yesterday's run to succeed
-    "start_date":       datetime(2024, 1, 1),
-    "retries":          2,           # Retry failed tasks twice
-    "retry_delay":      timedelta(minutes=5),
-    "email_on_failure": False,
+    "owner":                    "mlops",
+    "depends_on_past":          False,
+    "start_date":               datetime(2024, 1, 1),
+    "retries":                  2,
+    "retry_delay":              timedelta(minutes=5),
+    "retry_exponential_backoff": True,
+    "email_on_failure":         False,
+    "on_failure_callback":      on_failure,
 }
 
 dag = DAG(
     dag_id="stock_forecast_pipeline",
     default_args=default_args,
-    description="End-to-end stock price forecasting pipeline",
-    schedule_interval="0 18 * * 1-5",  # 6PM Monday–Friday (market days)
-    catchup=False,                     # Don't run missed historical runs
+    description="End-to-end stock price forecasting MLOps pipeline",
+    schedule_interval="0 18 * * 1-5",
+    catchup=False,
+    max_active_runs=1,
     tags=["mlops", "stock", "forecasting"],
 )
 
-
-# ── Task functions ─────────────────────────────────────────────────────────────
-
-def task_scrape():
-    from src.ingestion.scraper import run_scraper, run_price_fetcher
-    run_price_fetcher()   # fast — yfinance daily prices for all symbols
-    run_scraper()         # Selenium — quarterly financials (balance sheet + income stmt)
-
-
-def task_validate():
-    import os
-    from src.ingestion.validator import run_validation
-    passed = run_validation(os.getenv("RAW_DATA_PATH", "data/raw"))
-    if not passed:
-        raise ValueError("Data validation failed — check logs and alerts")
-
-
-def task_version_data(**context):
-    """DVC snapshot of raw data — links git commit to data hash."""
-    from src.versioning.dvc_ops import snapshot_raw_data
-    info = snapshot_raw_data()
-    # Push hash to XCom so training tasks can log it to MLflow
-    context["ti"].xcom_push(key="raw_data_hash",   value=info["hash"])
-    context["ti"].xcom_push(key="raw_data_commit",  value=info["commit"])
-
-
-def task_feature_engineering(**context):
-    from src.features.engineer import run_pipeline
-    outputs = run_pipeline()   # clean → feature engineer → DVC snapshot
-    context["ti"].xcom_push(key="feature_outputs", value=outputs)
-
-
-def _get_data_tags(context: dict) -> dict:
-    """Pull DVC hash + commit from XCom (set by task_version_data)."""
-    ti = context.get("ti")
-    if ti is None:
-        return {}
-    return {
-        "data_hash":   ti.xcom_pull(task_ids="version_data", key="raw_data_hash"),
-        "data_commit": ti.xcom_pull(task_ids="version_data", key="raw_data_commit"),
-    }
-
-
-def task_train_lstm(**context):
-    from src.training.train_lstm import train
-    train(**_get_data_tags(context))
-
-
-def task_train_tft(**context):
-    from src.training.train_tft import train
-    train(**_get_data_tags(context))
-
-
-def task_train_timesfm(**context):
-    from src.training.train_timesfm import train
-    train(**_get_data_tags(context))
-
-
-def task_train_arm(**context):
-    from src.training.train_arm import train
-    train(**_get_data_tags(context))
-
-
-def task_compare_models(**context):
-    from src.evaluation.compare_models import run_comparison
-    best = run_comparison()
-    # Push winner to XCom so task_register_model can pick it up
-    context["ti"].xcom_push(key="best_model_type", value=best.get("model_type"))
-    context["ti"].xcom_push(key="best_run_id",     value=best.get("run_id"))
-    context["ti"].xcom_push(key="best_val_loss",   value=best.get("val_loss"))
-
-
-def task_register_model(**context):
-    """Step 9 — promote winner through Staging → Production with validation."""
-    from src.registry.model_registry import register_best_model
-    ti = context["ti"]
-    best_info = {
-        "model_type": ti.xcom_pull(task_ids="compare_models", key="best_model_type"),
-        "run_id":     ti.xcom_pull(task_ids="compare_models", key="best_run_id"),
-        "val_loss":   ti.xcom_pull(task_ids="compare_models", key="best_val_loss"),
-    }
-    result = register_best_model(best_info)
-    logger.info(
-        f"Registry step complete: {result['model_type']} v{result['version']} "
-        f"→ {result['stage']} (promoted={result['promoted']})"
-    )
-    context["ti"].xcom_push(key="registry_result", value=result)
-
-
-def task_check_drift(**context):
-    from src.monitoring.drift import check_and_alert
-    needs_retrain = check_and_alert()
-    # Push result to XCom so next tasks can read it
-    context['ti'].xcom_push(key='needs_retraining', value=needs_retrain)
-
-
-# ── Define tasks ───────────────────────────────────────────────────────────────
+# ── Task objects ───────────────────────────────────────────────────────────────
 
 t1_scrape = PythonOperator(
     task_id="scrape_live_data",
     python_callable=task_scrape,
+    execution_timeout=timedelta(hours=2),
     dag=dag,
 )
 
 t2_validate = PythonOperator(
     task_id="validate_data",
     python_callable=task_validate,
+    execution_timeout=timedelta(minutes=15),
     dag=dag,
 )
 
@@ -166,6 +102,7 @@ t3_version = PythonOperator(
     task_id="version_data",
     python_callable=task_version_data,
     provide_context=True,
+    execution_timeout=timedelta(minutes=10),
     dag=dag,
 )
 
@@ -173,14 +110,15 @@ t4_features = PythonOperator(
     task_id="clean_and_engineer_features",
     python_callable=task_feature_engineering,
     provide_context=True,
+    execution_timeout=timedelta(hours=1),
     dag=dag,
 )
 
-# All 4 models train in PARALLEL (saves time)
 t5a_lstm = PythonOperator(
     task_id="train_lstm",
     python_callable=task_train_lstm,
     provide_context=True,
+    execution_timeout=timedelta(hours=3),
     dag=dag,
 )
 
@@ -188,6 +126,7 @@ t5b_tft = PythonOperator(
     task_id="train_tft",
     python_callable=task_train_tft,
     provide_context=True,
+    execution_timeout=timedelta(hours=4),
     dag=dag,
 )
 
@@ -195,6 +134,7 @@ t5c_timesfm = PythonOperator(
     task_id="train_timesfm",
     python_callable=task_train_timesfm,
     provide_context=True,
+    execution_timeout=timedelta(hours=2),
     dag=dag,
 )
 
@@ -202,45 +142,82 @@ t5d_arm = PythonOperator(
     task_id="train_arm",
     python_callable=task_train_arm,
     provide_context=True,
+    execution_timeout=timedelta(hours=1),
     dag=dag,
 )
 
-# Compare only after ALL 4 models finish
 t6_compare = PythonOperator(
     task_id="compare_models",
     python_callable=task_compare_models,
     provide_context=True,
     trigger_rule=TriggerRule.ALL_SUCCESS,
+    execution_timeout=timedelta(hours=1),
     dag=dag,
 )
 
-# Step 9 — promote winner through Staging → Production
-t6b_register = PythonOperator(
+t7_register = PythonOperator(
     task_id="register_best_model",
     python_callable=task_register_model,
     provide_context=True,
+    execution_timeout=timedelta(minutes=30),
     dag=dag,
 )
 
-t7_drift = PythonOperator(
+t8_deploy = PythonOperator(
+    task_id="deploy_to_api",
+    python_callable=task_deploy_to_api,
+    provide_context=True,
+    execution_timeout=timedelta(minutes=10),
+    retries=3,
+    dag=dag,
+)
+
+t9_drift = PythonOperator(
     task_id="check_drift",
     python_callable=task_check_drift,
+    provide_context=True,
+    execution_timeout=timedelta(minutes=30),
+    dag=dag,
+)
+
+t10_branch = BranchPythonOperator(
+    task_id="branch_on_drift",
+    python_callable=task_branch_on_drift,
     provide_context=True,
     dag=dag,
 )
 
-t8_report = BashOperator(
-    task_id="send_report",
-    bash_command="echo 'Pipeline complete. Check MLflow at http://localhost:5000'",
+t11_retrain = TriggerDagRunOperator(
+    task_id="trigger_retrain",
+    trigger_dag_id="stock_forecast_pipeline",
+    wait_for_completion=False,
     dag=dag,
 )
 
-# ── Task dependencies (defines the order) ─────────────────────────────────────
-#
-#  t1 → t2 → t3 → t4 → [t5a, t5b, t5c, t5d] → t6 → t7 → t8
-#
+t11_skip = EmptyOperator(
+    task_id="skip_retrain",
+    dag=dag,
+)
+
+t12_report = PythonOperator(
+    task_id="send_report",
+    python_callable=task_send_report,
+    provide_context=True,
+    trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    execution_timeout=timedelta(minutes=10),
+    dag=dag,
+)
+
+# ── Dependencies ───────────────────────────────────────────────────────────────
 
 t1_scrape >> t2_validate >> t3_version >> t4_features
+
 t4_features >> [t5a_lstm, t5b_tft, t5c_timesfm, t5d_arm]
+
 [t5a_lstm, t5b_tft, t5c_timesfm, t5d_arm] >> t6_compare
-t6_compare >> t6b_register >> t7_drift >> t8_report
+
+t6_compare >> t7_register >> t8_deploy >> t9_drift >> t10_branch
+
+t10_branch >> [t11_retrain, t11_skip]
+
+[t11_retrain, t11_skip] >> t12_report
