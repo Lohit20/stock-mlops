@@ -78,11 +78,12 @@ services:
       - backend
       - frontend
     command: >
+      bash -c "pip install --quiet psycopg2-binary &&
       mlflow server
       --backend-store-uri postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/${POSTGRES_DB:-mlops}
       --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
-      --port 5000
+      --port 5000"
     depends_on:
       postgres:
         condition: service_healthy
